@@ -1,6 +1,7 @@
 import os
 import sys
 from platform import system
+import time
 
 from PyQt6.QtCore import QTimer, pyqtSlot
 from PyQt6.QtGui import QAction, QIcon
@@ -49,12 +50,26 @@ class MainInterface(QWidget):
         self.tray.show()
                 
         self.app = app
+        self.obs_process = None
         
         self.init_tray()
         self.init_window()
         
+        # Check if OBS is already running before attempting to start it
+        self.ensure_obs_running()
+
+    def ensure_obs_running(self):
+        """Make sure OBS is running, launching it if necessary."""
         if not is_obs_running():
-            self.obs_process = open_obs()
+            try:
+                print("Starting OBS...")
+                self.obs_process = open_obs()
+                # Wait a moment for OBS to initialize
+                time.sleep(2)
+            except Exception as e:
+                self.display_error_message(f"Failed to start OBS: {str(e)}\nPlease start OBS manually.")
+        else:
+            print("OBS is already running")
 
     def init_window(self):
         self.setWindowTitle("DuckTrack")
@@ -166,10 +181,28 @@ class MainInterface(QWidget):
 
     @pyqtSlot()
     def quit(self):
+        print("Shutting down DuckTrack...")
+        
+        # First stop any active recording
         if hasattr(self, "recorder_thread"):
-            self.toggle_record()
-        if hasattr(self, "obs_process"):
-            close_obs(self.obs_process)
+            print("Stopping active recording...")
+            try:
+                self.recorder_thread.stop_recording()
+                self.recorder_thread.terminate()
+                del self.recorder_thread
+            except Exception as e:
+                print(f"Error stopping recording: {e}")
+        
+        # Only close OBS if we started it
+        if hasattr(self, "obs_process") and self.obs_process:
+            print("Closing OBS...")
+            try:
+                close_obs(self.obs_process)
+                self.obs_process = None
+            except Exception as e:
+                print(f"Error closing OBS: {e}")
+        
+        print("Quitting application...")
         self.app.quit()
 
     def closeEvent(self, event):
@@ -200,32 +233,53 @@ class MainInterface(QWidget):
     @pyqtSlot()
     def toggle_record(self):
         if not hasattr(self, "recorder_thread"):
-            self.recorder_thread = Recorder(natural_scrolling=self.natural_scrolling_checkbox.isChecked())
-            self.recorder_thread.recording_stopped.connect(self.on_recording_stopped)
-            self.recorder_thread.start()
-            self.update_menu(True)
-        else:
-            self.recorder_thread.stop_recording()
-            self.recorder_thread.terminate()
-
-            recording_dir = self.recorder_thread.recording_path
-
-            del self.recorder_thread
+            # Make sure OBS is running before starting a recording
+            if not is_obs_running():
+                try:
+                    print("OBS not running, attempting to start it...")
+                    self.ensure_obs_running()
+                    # Wait a bit for OBS to initialize
+                    time.sleep(3)
+                    if not is_obs_running():
+                        self.display_error_message("Failed to start OBS. Please start OBS manually and try again.")
+                        return
+                except Exception as e:
+                    self.display_error_message(f"Error starting OBS: {str(e)}\nPlease start OBS manually.")
+                    return
             
-            dialog = TitleDescriptionDialog()
-            QTimer.singleShot(0, dialog.raise_)
-            result = dialog.exec()
+            try:
+                self.recorder_thread = Recorder(natural_scrolling=self.natural_scrolling_checkbox.isChecked())
+                self.recorder_thread.recording_stopped.connect(self.on_recording_stopped)
+                self.recorder_thread.start()
+                self.update_menu(True)
+            except Exception as e:
+                self.display_error_message(f"Error starting recording: {str(e)}")
+        else:
+            try:
+                self.recorder_thread.stop_recording()
+                self.recorder_thread.terminate()
 
-            if result == QDialog.DialogCode.Accepted:
-                title, description = dialog.get_values()
+                recording_dir = self.recorder_thread.recording_path
 
-                if title:
-                    renamed_dir = os.path.join(os.path.dirname(recording_dir), title)
-                    os.rename(recording_dir, renamed_dir)
+                del self.recorder_thread
+                
+                dialog = TitleDescriptionDialog()
+                QTimer.singleShot(0, dialog.raise_)
+                result = dialog.exec()
 
-                    with open(os.path.join(renamed_dir, 'README.md'), 'w') as f:
-                        f.write(description)
-                    
+                if result == QDialog.DialogCode.Accepted:
+                    title, description = dialog.get_values()
+
+                    if title:
+                        renamed_dir = os.path.join(os.path.dirname(recording_dir), title)
+                        os.rename(recording_dir, renamed_dir)
+
+                        with open(os.path.join(renamed_dir, 'README.md'), 'w') as f:
+                            f.write(description)
+                
+                self.on_recording_stopped()
+            except Exception as e:
+                self.display_error_message(f"Error stopping recording: {str(e)}")
                 self.on_recording_stopped()
 
     @pyqtSlot()

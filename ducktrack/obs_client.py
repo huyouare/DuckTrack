@@ -17,12 +17,47 @@ def is_obs_running() -> bool:
         raise Exception("Could not check if OBS is running already. Please check manually.")
 
 def close_obs(obs_process: subprocess.Popen):
-    if obs_process:
-        obs_process.terminate()
+    try:
+        if obs_process:
+            if system() == "Darwin":
+                # Use AppleScript to quit OBS gracefully on macOS
+                try:
+                    subprocess.run(['osascript', '-e', 'tell application "OBS" to quit'], 
+                                  timeout=5, check=False)
+                    # Double-check if it's still running
+                    time.sleep(2)
+                    if is_obs_running():
+                        # Force kill as last resort
+                        subprocess.run(['killall', 'OBS'], check=False)
+                except Exception as e:
+                    print(f"Error gracefully closing OBS: {e}")
+                    # As a last resort, kill the process
+                    if obs_process:
+                        obs_process.kill()
+            else:
+                # Windows and Linux
+                obs_process.terminate()
+                try:
+                    obs_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    print("OBS didn't terminate gracefully, forcing kill")
+                    obs_process.kill()
+                    
+        # Wait for OBS to fully close
+        time.sleep(1)
+    except Exception as e:
+        print(f"Error closing OBS: {e}")
+        # Last resort: try to kill it
         try:
-            obs_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            obs_process.kill()
+            if system() == "Darwin":
+                subprocess.run(['killall', 'OBS'], check=False)
+            elif system() == "Windows":
+                subprocess.run(['taskkill', '/F', '/IM', 'obs64.exe'], check=False)
+                subprocess.run(['taskkill', '/F', '/IM', 'obs32.exe'], check=False)
+            else:
+                subprocess.run(['killall', 'obs'], check=False)
+        except:
+            pass
 
 def find_obs() -> str:
     common_paths = {
@@ -60,12 +95,25 @@ def find_obs() -> str:
 def open_obs() -> subprocess.Popen:
     try:
         obs_path = find_obs()
+        
         if system() == "Windows":
             # you have to change the working directory first for OBS to find the correct locale on windows
             os.chdir(os.path.dirname(obs_path))
             obs_path = os.path.basename(obs_path)
-        return subprocess.Popen([obs_path, "--startreplaybuffer", "--minimize-to-tray"])
-    except:
+            process = subprocess.Popen([obs_path, "--startreplaybuffer", "--minimize-to-tray"])
+        elif system() == "Darwin":  # macOS specific handling
+            # Use open command on macOS which handles permissions better than direct execution
+            process = subprocess.Popen(["open", "-a", "OBS"])
+            # Give OBS some time to initialize before trying to connect
+            time.sleep(2)
+        else:  # Linux
+            process = subprocess.Popen([obs_path, "--startreplaybuffer", "--minimize-to-tray"])
+            
+        # Give OBS some time to start before returning
+        time.sleep(1)
+        return process
+    except Exception as e:
+        print(f"Error launching OBS: {e}")
         raise Exception("Failed to find OBS, please open OBS manually.")
 
 class OBSClient:
@@ -84,8 +132,22 @@ class OBSClient:
     ):
         self.metadata = metadata
         
-        self.req_client = obs.ReqClient()
-        self.event_client = obs.EventClient()
+        # Try to connect to OBS with a retry mechanism
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                print(f"Attempting to connect to OBS WebSocket (attempt {attempt+1}/{max_retries})")
+                self.req_client = obs.ReqClient()
+                self.event_client = obs.EventClient()
+                break
+            except Exception as e:
+                print(f"Failed to connect to OBS WebSocket: {e}")
+                if attempt < max_retries - 1:
+                    print(f"Retrying in 2 seconds...")
+                    time.sleep(2)
+                else:
+                    print("Maximum retry attempts reached. Please ensure OBS is running with WebSocket enabled.")
+                    raise Exception("Failed to connect to OBS WebSocket after multiple attempts")
         
         self.record_state_events = {}
         
@@ -98,67 +160,94 @@ class OBSClient:
         
         self.event_client.callback.register(on_record_state_changed)
 
-        self.old_profile = self.req_client.get_profile_list().current_profile_name
-
-        if "computer_tracker" not in self.req_client.get_profile_list().profiles:
-            self.req_client.create_profile("computer_tracker")
-        else:
-            self.req_client.set_current_profile("computer_tracker")
-            self.req_client.create_profile("temp")
-            self.req_client.remove_profile("temp")
-            self.req_client.set_current_profile("computer_tracker")
-
-        base_width = metadata["screen_width"]
-        base_height = metadata["screen_height"]
-        
-        if metadata["system"] == "Darwin":
-            # for retina displays
-            # TODO: check if external displays are messed up by this
-            base_width *= 2
-            base_height *= 2
-        
-        scaled_width, scaled_height = _scale_resolution(base_width, base_height, output_width, output_height)
-        
-        self.req_client.set_profile_parameter("Video", "BaseCX", str(base_width))
-        self.req_client.set_profile_parameter("Video", "BaseCY", str(base_height))
-        self.req_client.set_profile_parameter("Video", "OutputCX", str(scaled_width))
-        self.req_client.set_profile_parameter("Video", "OutputCY", str(scaled_height))
-        self.req_client.set_profile_parameter("Video", "ScaleType", "lanczos")
-
-        self.req_client.set_profile_parameter("AdvOut", "RescaleRes", f"{base_width}x{base_height}")
-        self.req_client.set_profile_parameter("AdvOut", "RecRescaleRes", f"{base_width}x{base_height}")
-        self.req_client.set_profile_parameter("AdvOut", "FFRescaleRes", f"{base_width}x{base_height}")
-
-        self.req_client.set_profile_parameter("Video", "FPSCommon", str(fps))
-        self.req_client.set_profile_parameter("Video", "FPSInt", str(fps))
-        self.req_client.set_profile_parameter("Video", "FPSNum", str(fps))
-        self.req_client.set_profile_parameter("Video", "FPSDen", "1")
-        
-        self.req_client.set_profile_parameter("SimpleOutput", "RecFormat2", "mp4")
-        
-        bitrate = int(_get_bitrate_mbps(scaled_width, scaled_height, fps=fps) * 1000 / 50) * 50
-        self.req_client.set_profile_parameter("SimpleOutput", "VBitrate", str(bitrate))
-        
-        # do this in order to get pause & resume
-        self.req_client.set_profile_parameter("SimpleOutput", "RecQuality", "Small")
-
-        self.req_client.set_profile_parameter("SimpleOutput", "FilePath", recording_path)
-    
-        # TODO: not all OBS configs have this, maybe just instruct the user to mute themselves
-
-
         try:
-            self.req_client.set_input_mute("Mic/Aux", muted=True)
-        except obs.error.OBSSDKRequestError :
-            # In case there is no Mic/Aux input, this will throw an error
-            pass
+            # First, check if OBS is ready to accept WebSocket commands
+            try:
+                version = self.req_client.get_version()
+                print(f"Connected to OBS version: {version.obs_version}")
+            except Exception as e:
+                print(f"OBS is running but WebSocket might not be ready: {e}")
+                # Wait a bit longer for WebSocket to initialize
+                time.sleep(3)
+            
+            # Now proceed with profile operations
+            self.old_profile = self.req_client.get_profile_list().current_profile_name
+
+            # Profile creation/management with error handling
+            try:
+                profiles = self.req_client.get_profile_list().profiles
+                if "computer_tracker" not in profiles:
+                    self.req_client.create_profile("computer_tracker")
+                
+                # Set to computer_tracker profile
+                self.req_client.set_current_profile("computer_tracker")
+            except obs.error.OBSSDKRequestError as e:
+                print(f"Warning: Unable to create or switch to the 'computer_tracker' profile: {e}")
+                # Continue with the current profile
+                print("Continuing with the current OBS profile")
+
+            # Configure the video settings regardless of profile
+            base_width = metadata["screen_width"]
+            base_height = metadata["screen_height"]
+            
+            if metadata["system"] == "Darwin":
+                # for retina displays
+                # TODO: check if external displays are messed up by this
+                base_width *= 2
+                base_height *= 2
+            
+            scaled_width, scaled_height = _scale_resolution(base_width, base_height, output_width, output_height)
+            
+            self.req_client.set_profile_parameter("Video", "BaseCX", str(base_width))
+            self.req_client.set_profile_parameter("Video", "BaseCY", str(base_height))
+            self.req_client.set_profile_parameter("Video", "OutputCX", str(scaled_width))
+            self.req_client.set_profile_parameter("Video", "OutputCY", str(scaled_height))
+            self.req_client.set_profile_parameter("Video", "ScaleType", "lanczos")
+
+            self.req_client.set_profile_parameter("AdvOut", "RescaleRes", f"{base_width}x{base_height}")
+            self.req_client.set_profile_parameter("AdvOut", "RecRescaleRes", f"{base_width}x{base_height}")
+            self.req_client.set_profile_parameter("AdvOut", "FFRescaleRes", f"{base_width}x{base_height}")
+
+            self.req_client.set_profile_parameter("Video", "FPSCommon", str(fps))
+            self.req_client.set_profile_parameter("Video", "FPSInt", str(fps))
+            self.req_client.set_profile_parameter("Video", "FPSNum", str(fps))
+            self.req_client.set_profile_parameter("Video", "FPSDen", "1")
+            
+            self.req_client.set_profile_parameter("SimpleOutput", "RecFormat2", "mp4")
+            
+            bitrate = int(_get_bitrate_mbps(scaled_width, scaled_height, fps=fps) * 1000 / 50) * 50
+            self.req_client.set_profile_parameter("SimpleOutput", "VBitrate", str(bitrate))
+            
+            # do this in order to get pause & resume
+            self.req_client.set_profile_parameter("SimpleOutput", "RecQuality", "Small")
+
+            self.req_client.set_profile_parameter("SimpleOutput", "FilePath", recording_path)
+        
+            # TODO: not all OBS configs have this, maybe just instruct the user to mute themselves
+
+
+            try:
+                self.req_client.set_input_mute("Mic/Aux", muted=True)
+            except obs.error.OBSSDKRequestError :
+                # In case there is no Mic/Aux input, this will throw an error
+                pass
+        except obs.error.OBSSDKRequestError as e:
+            print(f"Warning: Unable to get current profile: {e}")
+            # Continue with the current profile
+            print("Continuing with the current OBS profile")
 
     def start_recording(self):
         self.req_client.start_record()
 
     def stop_recording(self):
         self.req_client.stop_record()
-        self.req_client.set_current_profile(self.old_profile) # restore old profile
+        
+        # Only try to restore the old profile if it was successfully stored during initialization
+        if hasattr(self, 'old_profile'):
+            try:
+                self.req_client.set_current_profile(self.old_profile) # restore old profile
+            except obs.error.OBSSDKRequestError as e:
+                print(f"Warning: Unable to restore original profile: {e}")
 
     def pause_recording(self):
         self.req_client.pause_record()
