@@ -1,11 +1,14 @@
 import os
 import subprocess
 import time
+import logging
 from platform import system
 
 import obsws_python as obs
 import psutil
 
+# Get logger
+logger = logging.getLogger('DuckTrack.OBSClient')
 
 def is_obs_running() -> bool:
     try:
@@ -30,7 +33,7 @@ def close_obs(obs_process: subprocess.Popen):
                         # Force kill as last resort
                         subprocess.run(['killall', 'OBS'], check=False)
                 except Exception as e:
-                    print(f"Error gracefully closing OBS: {e}")
+                    logger.error(f"Error gracefully closing OBS: {e}")
                     # As a last resort, kill the process
                     if obs_process:
                         obs_process.kill()
@@ -40,13 +43,13 @@ def close_obs(obs_process: subprocess.Popen):
                 try:
                     obs_process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    print("OBS didn't terminate gracefully, forcing kill")
+                    logger.error("OBS didn't terminate gracefully, forcing kill")
                     obs_process.kill()
                     
         # Wait for OBS to fully close
         time.sleep(1)
     except Exception as e:
-        print(f"Error closing OBS: {e}")
+        logger.error(f"Error closing OBS: {e}")
         # Last resort: try to kill it
         try:
             if system() == "Darwin":
@@ -113,7 +116,7 @@ def open_obs() -> subprocess.Popen:
         time.sleep(1)
         return process
     except Exception as e:
-        print(f"Error launching OBS: {e}")
+        logger.error(f"Error launching OBS: {e}")
         raise Exception("Failed to find OBS, please open OBS manually.")
 
 class OBSClient:
@@ -136,24 +139,24 @@ class OBSClient:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                print(f"Attempting to connect to OBS WebSocket (attempt {attempt+1}/{max_retries})")
+                logger.info(f"Attempting to connect to OBS WebSocket (attempt {attempt+1}/{max_retries})")
                 self.req_client = obs.ReqClient()
                 self.event_client = obs.EventClient()
                 break
             except Exception as e:
-                print(f"Failed to connect to OBS WebSocket: {e}")
+                logger.error(f"Failed to connect to OBS WebSocket: {e}")
                 if attempt < max_retries - 1:
-                    print(f"Retrying in 2 seconds...")
+                    logger.info(f"Retrying in 2 seconds...")
                     time.sleep(2)
                 else:
-                    print("Maximum retry attempts reached. Please ensure OBS is running with WebSocket enabled.")
+                    logger.error("Maximum retry attempts reached. Please ensure OBS is running with WebSocket enabled.")
                     raise Exception("Failed to connect to OBS WebSocket after multiple attempts")
         
         self.record_state_events = {}
         
         def on_record_state_changed(data):
             output_state = data.output_state
-            print("record state changed:", output_state)
+            logger.info("record state changed: %s", output_state)
             if output_state not in self.record_state_events:
                 self.record_state_events[output_state] = []
             self.record_state_events[output_state].append(time.perf_counter())
@@ -164,9 +167,9 @@ class OBSClient:
             # First, check if OBS is ready to accept WebSocket commands
             try:
                 version = self.req_client.get_version()
-                print(f"Connected to OBS version: {version.obs_version}")
+                logger.info("Connected to OBS version: %s", version.obs_version)
             except Exception as e:
-                print(f"OBS is running but WebSocket might not be ready: {e}")
+                logger.warning("OBS is running but WebSocket might not be ready: %s", e)
                 # Wait a bit longer for WebSocket to initialize
                 time.sleep(3)
             
@@ -182,9 +185,9 @@ class OBSClient:
                 # Set to computer_tracker profile
                 self.req_client.set_current_profile("computer_tracker")
             except obs.error.OBSSDKRequestError as e:
-                print(f"Warning: Unable to create or switch to the 'computer_tracker' profile: {e}")
+                logger.warning("Warning: Unable to create or switch to the 'computer_tracker' profile: %s", e)
                 # Continue with the current profile
-                print("Continuing with the current OBS profile")
+                logger.info("Continuing with the current OBS profile")
 
             # Configure the video settings regardless of profile
             base_width = metadata["screen_width"]
@@ -232,9 +235,9 @@ class OBSClient:
                 # In case there is no Mic/Aux input, this will throw an error
                 pass
         except obs.error.OBSSDKRequestError as e:
-            print(f"Warning: Unable to get current profile: {e}")
+            logger.warning("Warning: Unable to get current profile: %s", e)
             # Continue with the current profile
-            print("Continuing with the current OBS profile")
+            logger.info("Continuing with the current OBS profile")
 
     def start_recording(self):
         self.req_client.start_record()
@@ -247,7 +250,7 @@ class OBSClient:
             try:
                 self.req_client.set_current_profile(self.old_profile) # restore old profile
             except obs.error.OBSSDKRequestError as e:
-                print(f"Warning: Unable to restore original profile: {e}")
+                logger.warning("Warning: Unable to restore original profile: %s", e)
 
     def pause_recording(self):
         self.req_client.pause_record()

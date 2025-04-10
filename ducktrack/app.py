@@ -1,37 +1,80 @@
 import os
 import sys
+import logging
 from platform import system
 import time
+from datetime import datetime
 
-from PyQt6.QtCore import QTimer, pyqtSlot
+from PyQt6.QtCore import QTimer, pyqtSlot, Qt
 from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog,
                              QFormLayout, QLabel, QLineEdit, QMenu,
                              QMessageBox, QPushButton, QSystemTrayIcon,
                              QTextEdit, QVBoxLayout, QWidget)
 
-from .obs_client import close_obs, is_obs_running, open_obs
-from .playback import Player, get_latest_recording
-from .recorder import Recorder
-from .util import get_recordings_dir, open_file
+# Import using absolute paths for PyInstaller compatibility
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    # Running in a PyInstaller bundle
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from ducktrack.obs_client import close_obs, is_obs_running, open_obs
+    from ducktrack.playback import Player, get_latest_recording
+    from ducktrack.recorder import Recorder
+    from ducktrack.util import get_recordings_dir, open_file
+else:
+    # Running in a normal Python environment
+    from .obs_client import close_obs, is_obs_running, open_obs
+    from .playback import Player, get_latest_recording
+    from .recorder import Recorder
+    from .util import get_recordings_dir, open_file
 
+# Set up logging to file
+log_file = os.path.expanduser("~/ducktrack.log")
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    filename=log_file,
+    filemode='a'
+)
+
+# Also log to stderr
+console = logging.StreamHandler()
+console.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+console.setFormatter(formatter)
+logging.getLogger('').addHandler(console)
+
+logger = logging.getLogger('DuckTrack')
+
+# Redirect print statements to logger
+original_print = print
+def print_to_log(*args, **kwargs):
+    message = ' '.join(str(arg) for arg in args)
+    logger.info(message)
+    original_print(*args, **kwargs)
+print = print_to_log
+
+logger.info("----- DuckTrack Starting -----")
 
 class TitleDescriptionDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
 
         self.setWindowTitle("Recording Details")
-
+        self.setMinimumWidth(400)  # Make the dialog a bit wider
+        
         layout = QVBoxLayout(self)
 
         self.form_layout = QFormLayout()
 
         self.title_label = QLabel("Title:")
         self.title_input = QLineEdit(self)
+        self.title_input.setText(f"Recording-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}")  # Default title
         self.form_layout.addRow(self.title_label, self.title_input)
 
         self.description_label = QLabel("Description:")
         self.description_input = QTextEdit(self)
+        self.description_input.setPlaceholderText("Enter a description of what happened in this recording...")
+        self.description_input.setMinimumHeight(100)  # Make the description box taller
         self.form_layout.addRow(self.description_label, self.description_input)
 
         layout.addLayout(self.form_layout)
@@ -55,8 +98,35 @@ class MainInterface(QWidget):
         self.init_tray()
         self.init_window()
         
+        # Check if on macOS and ensure permissions
+        if system() == "Darwin":
+            self.check_macos_permissions()
+        
         # Check if OBS is already running before attempting to start it
         self.ensure_obs_running()
+
+    def check_macos_permissions(self):
+        """Guide the user through setting up required permissions on macOS."""
+        # Inform the user about required permissions
+        QMessageBox.information(
+            self, 
+            "Permissions Required",
+            "DuckTrack needs several permissions to function correctly:\n\n"
+            "1. Screen Recording - to capture your screen\n"
+            "2. Accessibility - to track mouse movements\n"
+            "3. Input Monitoring - to track keyboard events\n\n"
+            "You may be prompted to allow these permissions. Please grant them when asked."
+        )
+        
+        # For debugging, try to trigger permission checks
+        import subprocess
+        try:
+            subprocess.run(
+                ["osascript", "-e", 'tell application "System Events" to keystroke ""'],
+                capture_output=True, timeout=1
+            )
+        except:
+            pass
 
     def ensure_obs_running(self):
         """Make sure OBS is running, launching it if necessary."""
@@ -100,6 +170,11 @@ class MainInterface(QWidget):
         self.replay_recording_button.clicked.connect(self.replay_recording)
         self.replay_recording_button.setEnabled(False)
         layout.addWidget(self.replay_recording_button)
+        
+        # Add a view logs button
+        self.view_logs_button = QPushButton("View Debug Logs", self)
+        self.view_logs_button.clicked.connect(self.show_log_viewer)
+        layout.addWidget(self.view_logs_button)
         
         self.quit_button = QPushButton("Quit", self)
         self.quit_button.clicked.connect(self.quit)
@@ -263,20 +338,49 @@ class MainInterface(QWidget):
 
                 del self.recorder_thread
                 
-                dialog = TitleDescriptionDialog()
+                # Show dialog to get title and description
+                dialog = TitleDescriptionDialog(self)  # Pass self as parent
+                dialog.setWindowModality(Qt.WindowModality.ApplicationModal)  # Make sure it blocks until user responds
+                
+                # Use QTimer.singleShot to make sure dialog appears on top
                 QTimer.singleShot(0, dialog.raise_)
+                QTimer.singleShot(0, dialog.activateWindow)
+                
                 result = dialog.exec()
 
                 if result == QDialog.DialogCode.Accepted:
                     title, description = dialog.get_values()
 
-                    if title:
-                        renamed_dir = os.path.join(os.path.dirname(recording_dir), title)
+                    # Use default title if empty
+                    if not title:
+                        title = f"Recording-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
+                    
+                    # Rename the directory with the title
+                    renamed_dir = os.path.join(os.path.dirname(recording_dir), title)
+                    try:
                         os.rename(recording_dir, renamed_dir)
-
-                        with open(os.path.join(renamed_dir, 'README.md'), 'w') as f:
-                            f.write(description)
-                
+                        print(f"Renamed recording directory to {renamed_dir}")
+                    except Exception as e:
+                        print(f"Error renaming directory: {e}")
+                        renamed_dir = recording_dir  # Fallback to original directory
+                    
+                    # Create README with the description (even if empty)
+                    readme_path = os.path.join(renamed_dir, 'README.md')
+                    try:
+                        with open(readme_path, 'w') as f:
+                            f.write(description or "No description provided.")
+                        print(f"Saved README to {readme_path}")
+                    except Exception as e:
+                        print(f"Error writing README: {e}")
+                else:
+                    # User canceled - still create a default README
+                    try:
+                        with open(os.path.join(recording_dir, 'README.md'), 'w') as f:
+                            f.write("Recording saved without description.")
+                        print("Created default README.md")
+                    except Exception as e:
+                        print(f"Error creating default README: {e}")
+                    
                 self.on_recording_stopped()
             except Exception as e:
                 self.display_error_message(f"Error stopping recording: {str(e)}")
@@ -296,6 +400,57 @@ class MainInterface(QWidget):
     def display_error_message(self, message):
         QMessageBox.critical(None, "Error", message)
         
+    def show_log_viewer(self):
+        """Show a dialog with the contents of the log file."""
+        log_file = os.path.expanduser("~/ducktrack.log")
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("DuckTrack Debug Logs")
+        dialog.resize(800, 600)
+        
+        layout = QVBoxLayout()
+        
+        log_text = QTextEdit()
+        log_text.setReadOnly(True)
+        
+        # Load log file contents
+        try:
+            with open(log_file, 'r') as f:
+                log_content = f.read()
+                log_text.setText(log_content)
+                
+                # Scroll to the end
+                cursor = log_text.textCursor()
+                cursor.movePosition(cursor.MoveOperation.End)
+                log_text.setTextCursor(cursor)
+        except Exception as e:
+            log_text.setText(f"Error loading log file: {str(e)}")
+        
+        layout.addWidget(log_text)
+        
+        # Add refresh button
+        refresh_button = QPushButton("Refresh")
+        refresh_button.clicked.connect(lambda: self.refresh_log_view(log_text))
+        layout.addWidget(refresh_button)
+        
+        dialog.setLayout(layout)
+        dialog.exec()
+    
+    def refresh_log_view(self, text_edit):
+        """Refresh the log view with the latest content."""
+        log_file = os.path.expanduser("~/ducktrack.log")
+        try:
+            with open(log_file, 'r') as f:
+                log_content = f.read()
+                text_edit.setText(log_content)
+                
+                # Scroll to the end
+                cursor = text_edit.textCursor()
+                cursor.movePosition(cursor.MoveOperation.End)
+                text_edit.setTextCursor(cursor)
+        except Exception as e:
+            text_edit.setText(f"Error loading log file: {str(e)}")
+
 def resource_path(relative_path: str) -> str:
     if hasattr(sys, '_MEIPASS'):
         base_path = getattr(sys, "_MEIPASS")
